@@ -3,12 +3,18 @@ from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandl
 from functools import wraps
 from telegram.constants import ParseMode
 import asyncio
+from firebase_config import initialize_firebase, upload_file_to_firebase, download_file_from_firebase
+import tempfile
+import os
 
 from config import TOKEN, ADMIN_IDS
 from database import init_db, SessionLocal, User, QuestionPaper
 
 # List of required channel usernames (to be filled by admin)
 REQUIRED_CHANNELS = []
+
+# Initialize Firebase
+bucket = initialize_firebase()
 
 # --- Database Utility Functions ---
 async def get_or_create_user(telegram_id: int, db):
@@ -383,7 +389,7 @@ async def select_paper_callback(update: Update, context: ContextTypes.DEFAULT_TY
     db.refresh(user)
     if paper in user.purchased_papers:
         await query.edit_message_text(f"You have already purchased {paper.paper_name}. Sending it again.")
-        await send_paper_pdf(update, context, paper.file_path, paper.paper_name)
+        await send_paper_pdf(update, context, paper)
         db.close()
         return
 
@@ -395,7 +401,7 @@ async def select_paper_callback(update: Update, context: ContextTypes.DEFAULT_TY
             db.commit()
             db.refresh(user)
             await query.edit_message_text(f"Successfully purchased {paper.paper_name} for {paper.price} stars. Your remaining stars: {user.stars}")
-            await send_paper_pdf(update, context, paper.file_path, paper.paper_name)
+            await send_paper_pdf(update, context, paper)
         except Exception as e:
             db.rollback()
             await query.edit_message_text(f"An error occurred during purchase: {e}")
@@ -463,7 +469,7 @@ async def bulk_purchase_callback(update: Update, context: ContextTypes.DEFAULT_T
             db.refresh(user)
             await query.edit_message_text(f"Successfully purchased {len(papers_to_purchase)} papers for {discounted_price} stars (10% discount). Your remaining stars: {user.stars}")
             for paper in papers_to_purchase:
-                await send_paper_pdf(update, context, paper.file_path, paper.paper_name)
+                await send_paper_pdf(update, context, paper)
         except Exception as e:
             db.rollback()
             await query.edit_message_text(f"An error occurred during bulk purchase: {e}")
@@ -560,21 +566,34 @@ async def back_to_year_callback(update: Update, context: ContextTypes.DEFAULT_TY
         await query.edit_message_text("Department or semester not found in context.", reply_markup=error_keyboard("back_to_dept"))
 
 
-async def send_paper_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE, file_path: str, paper_name: str):
-    import os
-    ext = os.path.splitext(file_path)[1].lower()
+async def send_paper_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE, paper: QuestionPaper):
+    """Send paper PDF to user"""
     try:
-        with open(file_path, 'rb') as f:
-            if ext in [".jpg", ".jpeg", ".png"]:
-                await context.bot.send_photo(chat_id=update.effective_chat.id, photo=f, caption=paper_name)
-            elif ext == ".pdf":
-                await context.bot.send_document(chat_id=update.effective_chat.id, document=InputFile(f, filename=f'{paper_name}.pdf'))
-            else:
-                await context.bot.send_message(chat_id=update.effective_chat.id, text=f"Unsupported file type: {ext}")
-    except FileNotFoundError:
-        await context.bot.send_message(chat_id=update.effective_chat.id, text=f"Error: The file for '{paper_name}' was not found at '{file_path}'. Please inform the bot administrator.")
+        # Create temp directory if it doesn't exist
+        os.makedirs("temp", exist_ok=True)
+        
+        # Download file from Firebase
+        file_name = paper.paper_name
+        temp_path = f"temp/{file_name}"
+        
+        # Get file name from URL
+        firebase_path = paper.file_url.split('/')[-1]
+        await download_file_from_firebase(f"papers/{firebase_path}", temp_path)
+        
+        # Send file to user
+        with open(temp_path, 'rb') as file:
+            await context.bot.send_document(
+                chat_id=update.effective_chat.id,
+                document=file,
+                filename=file_name,
+                caption=f"📚 {paper.department} - Semester {paper.semester} - Year {paper.year}"
+            )
+        
+        # Clean up temp file
+        os.remove(temp_path)
+        
     except Exception as e:
-        await context.bot.send_message(chat_id=update.effective_chat.id, text=f"An unexpected error occurred while sending '{paper_name}': {e}")
+        await update.effective_message.reply_text(f"❌ Error sending file: {str(e)}")
 
 # --- Admin/Testing Commands ---
 async def add_stars_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -692,7 +711,7 @@ async def successful_payment_callback(update: Update, context: ContextTypes.DEFA
             db.commit()
             db.refresh(user)
             await update.message.reply_text(f"🎉 Payment successful! You've purchased {paper.paper_name}. Sending it now...")
-            await send_paper_pdf(update, context, paper.file_path, paper.paper_name)
+            await send_paper_pdf(update, context, paper)
     elif payload.startswith("bulk_purchase_"):
         parts = payload.split("_")
         department = parts[2]
@@ -714,7 +733,7 @@ async def successful_payment_callback(update: Update, context: ContextTypes.DEFA
             db.refresh(user)
             await update.message.reply_text(f"🎉 Payment successful! You've purchased {purchased_count} papers for {department} - {semester} - {year}. Sending them now...")
             for paper in papers_in_year:
-                await send_paper_pdf(update, context, paper.file_path, paper.paper_name)
+                await send_paper_pdf(update, context, paper)
         else:
             await update.message.reply_text("You already owned all papers in this bulk set. No new papers were sent.")
     db.close()
@@ -924,54 +943,70 @@ async def list_qp(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"No question papers found for {dept} {sem} {year}.")
 
 # --- File Upload Handler for Admins ---
+@admin_only
 async def admin_file_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if 'upload_qp' not in context.user_data:
-        return
-
-    # Handle document (PDF, DOC, etc.)
-    if update.message.document:
-        file = update.message.document
-        file_name = file.file_name or "question_paper.pdf"
-        # Accept only PDF, PNG, JPEG
-        if not (file_name.lower().endswith('.pdf') or file_name.lower().endswith('.png') or file_name.lower().endswith('.jpg') or file_name.lower().endswith('.jpeg')):
-            await update.message.reply_text("Please send a PDF, PNG, or JPEG file.")
+    """Handle file uploads from admin"""
+    try:
+        # Get file info
+        if update.message.document:
+            file = update.message.document
+            file_name = file.file_name
+        elif update.message.photo:
+            file = update.message.photo[-1]  # Get the largest photo
+            file_name = f"photo_{file.file_id}.jpg"
+        else:
+            await update.message.reply_text("❌ Please send a document or photo.")
             return
-        file_ext = file_name.split('.')[-1]
-    # Handle photo (JPEG, PNG)
-    elif update.message.photo:
-        file = update.message.photo[-1]  # Get the highest resolution
-        file_ext = "jpg"
-        file_name = "question_paper.jpg"
-    else:
-        await update.message.reply_text("Please send a valid file (PDF, PNG, JPEG, etc).")
-        return
 
-    meta = context.user_data['upload_qp']
-    dept, sem, year, subject = meta['department'], meta['semester'], meta['year'], meta['subject']
-    new_path = f"papers/{dept}/{sem}/{year}/"
-    import os
-    os.makedirs(new_path, exist_ok=True)
-    file_path = os.path.join(new_path, f"{subject}.{file_ext}")
-
-    # Download file
-    new_file = await file.get_file()
-    await new_file.download_to_drive(file_path)
-
-    # Save to DB
-    db = SessionLocal()
-    db.add(QuestionPaper(
-        department=dept,
-        semester=sem,
-        year=year,
-        paper_name=subject,
-        file_path=file_path,
-        price=5
-    ))
-    db.commit()
-    db.close()
-    await update.message.reply_text(f"Question paper '{subject}' uploaded for {dept} {sem} {year}.")
-    context.user_data.pop('upload_qp')
-    await notify_new_paper(dept, sem, year, subject, context)
+        # Create temp directory if it doesn't exist
+        os.makedirs("temp", exist_ok=True)
+        
+        # Download file to temp directory
+        file_path = f"temp/{file_name}"
+        telegram_file = await context.bot.get_file(file.file_id)
+        await telegram_file.download_to_drive(file_path)
+        
+        # Upload to Firebase Storage
+        firebase_path = f"papers/{file_name}"
+        file_url = await upload_file_to_firebase(file_path, firebase_path)
+        
+        # Clean up temp file
+        os.remove(file_path)
+        
+        # Save to database
+        db = SessionLocal()
+        try:
+            # Extract information from file name or context
+            dept = context.user_data.get('dept', 'CSE')  # Default or from previous input
+            sem = context.user_data.get('sem', 1)
+            year = context.user_data.get('year', 2024)
+            
+            new_paper = QuestionPaper(
+                department=dept,
+                semester=sem,
+                year=year,
+                paper_name=file_name,
+                file_url=file_url,
+                price=5  # Default price
+            )
+            db.add(new_paper)
+            db.commit()
+            
+            await update.message.reply_text(
+                "✅ File uploaded successfully!\n"
+                f"Department: {dept}\n"
+                f"Semester: {sem}\n"
+                f"Year: {year}\n"
+                f"Price: 5 stars"
+            )
+        except Exception as e:
+            db.rollback()
+            raise e
+        finally:
+            db.close()
+            
+    except Exception as e:
+        await update.message.reply_text(f"❌ Error uploading file: {str(e)}")
 
 # --- Admin-Only Commands ---
 @admin_only

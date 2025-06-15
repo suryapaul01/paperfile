@@ -1,51 +1,41 @@
 from sqlalchemy import create_engine, Column, Integer, String, ForeignKey, Table
-from sqlalchemy.orm import declarative_base, sessionmaker, relationship
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import sessionmaker, relationship
 
 Base = declarative_base()
 
-# Association table for many-to-many relationship between users and purchased papers
-purchased_papers_association = Table(
-    'purchased_papers',
-    Base.metadata,
+# Association table for many-to-many relationship between users and papers
+user_papers = Table('user_papers', Base.metadata,
     Column('user_id', Integer, ForeignKey('users.id')),
-    Column('paper_id', Integer, ForeignKey('question_papers.id'))
+    Column('paper_id', Integer, ForeignKey('papers.id'))
 )
 
 class User(Base):
     __tablename__ = 'users'
+    
     id = Column(Integer, primary_key=True)
-    telegram_id = Column(Integer, unique=True, nullable=False)
+    telegram_id = Column(Integer, unique=True)
     stars = Column(Integer, default=0)
-
-    purchased_papers = relationship("QuestionPaper", secondary=purchased_papers_association, back_populates="purchasers")
-
-    def __repr__(self):
-        return f"<User(telegram_id={self.telegram_id}, stars={self.stars})>"
+    purchased_papers = relationship("QuestionPaper", secondary=user_papers, backref="purchased_by")
 
 class QuestionPaper(Base):
-    __tablename__ = 'question_papers'
+    __tablename__ = 'papers'
+    
     id = Column(Integer, primary_key=True)
-    department = Column(String, nullable=False)
-    semester = Column(String, nullable=False)
-    year = Column(String, nullable=False)
-    paper_name = Column(String, nullable=False)
-    file_path = Column(String, nullable=False)
-    price = Column(Integer, default=10) # Default price is 10 stars
-
-    purchasers = relationship("User", secondary=purchased_papers_association, back_populates="purchased_papers")
-
-    def __repr__(self):
-        return f"<QuestionPaper(department={self.department}, semester={self.semester}, year={self.year}, paper_name={self.paper_name})>"
-
+    department = Column(String)
+    semester = Column(Integer)
+    year = Column(Integer)
+    paper_name = Column(String)
+    file_url = Column(String)  # Firebase Storage URL
+    price = Column(Integer, default=5)
 
 # Database setup
-DATABASE_URL = "sqlite:///./bot.db"
-
-engine = create_engine(DATABASE_URL)
-SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
-
 def init_db():
-    Base.metadata.create_all(bind=engine)
+    engine = create_engine('sqlite:///bot.db')
+    Base.metadata.create_all(engine)
+    return engine
+
+SessionLocal = sessionmaker(bind=init_db())
 
 def get_db():
     db = SessionLocal()
