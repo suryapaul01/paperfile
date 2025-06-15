@@ -1,0 +1,1 @@
+web: cd makautpaperbackend && python bot.py 

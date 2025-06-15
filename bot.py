@@ -1,11 +1,16 @@
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputFile, LabeledPrice, ChatMember
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters, CallbackQueryHandler, PreCheckoutQueryHandler
+from telegram.error import Conflict, NetworkError, TelegramError
 from functools import wraps
 from telegram.constants import ParseMode
 import asyncio
+import signal
+import sys
 from firebase_config import initialize_firebase, upload_file_to_firebase, download_file_from_firebase
 import tempfile
 import os
+import atexit
+from pathlib import Path
 
 from config import TOKEN, ADMIN_IDS
 from database import init_db, SessionLocal, User, QuestionPaper
@@ -80,6 +85,26 @@ def admin_only(func):
             return
         return await func(update, context, *args, **kwargs)
     return wrapper
+
+# --- Error Handlers ---
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle errors caused by updates."""
+    if isinstance(context.error, Conflict):
+        print("Error: Bot instance is already running elsewhere. Shutting down...")
+        await context.application.stop()
+        sys.exit(1)
+    elif isinstance(context.error, NetworkError):
+        print("Network error occurred. Waiting before retry...")
+        await asyncio.sleep(1)
+    else:
+        print(f"Error: {str(context.error)}")
+
+# --- Signal Handlers ---
+def signal_handler(signum, frame):
+    """Handle shutdown signals gracefully"""
+    print("Received shutdown signal. Cleaning up...")
+    cleanup()
+    sys.exit(0)
 
 # --- Command Handlers ---
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -947,13 +972,20 @@ async def list_qp(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def admin_file_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle file uploads from admin"""
     try:
+        # Check if this is a response to upload_qp command
+        if 'upload_qp' not in context.user_data:
+            await update.message.reply_text("❌ Please use /upload_qp command first to specify paper details.")
+            return
+
+        paper_info = context.user_data['upload_qp']
+        
         # Get file info
         if update.message.document:
             file = update.message.document
             file_name = file.file_name
         elif update.message.photo:
             file = update.message.photo[-1]  # Get the largest photo
-            file_name = f"photo_{file.file_id}.jpg"
+            file_name = f"{paper_info['subject']}_{paper_info['year']}.jpg"
         else:
             await update.message.reply_text("❌ Please send a document or photo.")
             return
@@ -961,52 +993,73 @@ async def admin_file_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
         # Create temp directory if it doesn't exist
         os.makedirs("temp", exist_ok=True)
         
-        # Download file to temp directory
-        file_path = f"temp/{file_name}"
-        telegram_file = await context.bot.get_file(file.file_id)
-        await telegram_file.download_to_drive(file_path)
-        
-        # Upload to Firebase Storage
-        firebase_path = f"papers/{file_name}"
-        file_url = await upload_file_to_firebase(file_path, firebase_path)
-        
-        # Clean up temp file
-        os.remove(file_path)
-        
-        # Save to database
-        db = SessionLocal()
         try:
-            # Extract information from file name or context
-            dept = context.user_data.get('dept', 'CSE')  # Default or from previous input
-            sem = context.user_data.get('sem', 1)
-            year = context.user_data.get('year', 2024)
+            # Download file to temp directory
+            file_path = f"temp/{file_name}"
+            telegram_file = await context.bot.get_file(file.file_id)
+            await telegram_file.download_to_drive(file_path)
             
-            new_paper = QuestionPaper(
-                department=dept,
-                semester=sem,
-                year=year,
-                paper_name=file_name,
-                file_url=file_url,
-                price=5  # Default price
-            )
-            db.add(new_paper)
-            db.commit()
+            # Upload to Firebase Storage
+            firebase_path = f"papers/{paper_info['department']}/{paper_info['semester']}/{paper_info['year']}/{file_name}"
+            file_url = await upload_file_to_firebase(file_path, firebase_path)
             
-            await update.message.reply_text(
-                "✅ File uploaded successfully!\n"
-                f"Department: {dept}\n"
-                f"Semester: {sem}\n"
-                f"Year: {year}\n"
-                f"Price: 5 stars"
-            )
+            # Save to database
+            db = SessionLocal()
+            try:
+                new_paper = QuestionPaper(
+                    department=paper_info['department'],
+                    semester=paper_info['semester'],
+                    year=paper_info['year'],
+                    paper_name=paper_info['subject'],
+                    file_url=file_url,
+                    price=5  # Default price
+                )
+                db.add(new_paper)
+                db.commit()
+                
+                await update.message.reply_text(
+                    "✅ File uploaded successfully!\n"
+                    f"Department: {paper_info['department']}\n"
+                    f"Semester: {paper_info['semester']}\n"
+                    f"Year: {paper_info['year']}\n"
+                    f"Subject: {paper_info['subject']}\n"
+                    f"Price: 5 stars"
+                )
+                
+                # Notify users about new paper
+                await notify_new_paper(
+                    paper_info['department'],
+                    paper_info['semester'],
+                    paper_info['year'],
+                    paper_info['subject'],
+                    context
+                )
+                
+            except Exception as e:
+                db.rollback()
+                raise e
+            finally:
+                db.close()
+                
         except Exception as e:
-            db.rollback()
-            raise e
+            await update.message.reply_text(f"❌ Error processing file: {str(e)}")
         finally:
-            db.close()
+            # Clean up temp file
+            try:
+                if os.path.exists(file_path):
+                    os.remove(file_path)
+            except Exception as e:
+                print(f"Error cleaning up temp file: {str(e)}")
+            
+            # Clear the upload context
+            if 'upload_qp' in context.user_data:
+                del context.user_data['upload_qp']
             
     except Exception as e:
         await update.message.reply_text(f"❌ Error uploading file: {str(e)}")
+        # Clear the upload context on error
+        if 'upload_qp' in context.user_data:
+            del context.user_data['upload_qp']
 
 # --- Admin-Only Commands ---
 @admin_only
@@ -1375,39 +1428,66 @@ async def check_subscription_callback(update: Update, context: ContextTypes.DEFA
     if is_subscribed:
         await start_command(update, context)
 
-def main():
-    init_db() # Initialize the database
+def is_bot_running():
+    pid_file = Path("bot.pid")
+    if pid_file.exists():
+        try:
+            with open(pid_file) as f:
+                old_pid = int(f.read().strip())
+            # Check if process with this PID exists
+            os.kill(old_pid, 0)
+            return True
+        except (OSError, ValueError):
+            # Process not running or PID file is invalid
+            pid_file.unlink(missing_ok=True)
+    return False
 
+def save_pid():
+    with open("bot.pid", "w") as f:
+        f.write(str(os.getpid()))
+
+def cleanup():
+    try:
+        # Remove PID file
+        Path("bot.pid").unlink(missing_ok=True)
+        # Clean temp directory
+        if os.path.exists("temp"):
+            for file in os.listdir("temp"):
+                os.remove(os.path.join("temp", file))
+            os.rmdir("temp")
+    except Exception as e:
+        print(f"Error during cleanup: {e}")
+
+def main():
+    """Start the bot."""
+    # Create the Application
     application = Application.builder().token(TOKEN).build()
+
+    # Register error handler
+    application.add_error_handler(error_handler)
+
+    # Register signal handlers
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
 
     # Command Handlers
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("history", history_command))
     application.add_handler(CommandHandler("profile", profile_command))
-    application.add_handler(CommandHandler("about", about_us_command))
+    application.add_handler(CommandHandler("about_us", about_us_command))
     application.add_handler(CommandHandler("purchase", purchase_command))
-    application.add_handler(CommandHandler("buy_star", buy_star_command))
     application.add_handler(CommandHandler("add_stars", add_stars_command))
+    application.add_handler(CommandHandler("buy_star", buy_star_command))
     application.add_handler(CommandHandler("adminbuystar", adminbuystar_command))
     application.add_handler(CommandHandler("admin_help", admin_help_command))
-    application.add_handler(CommandHandler("add_bulk", add_bulk))
     application.add_handler(CommandHandler("notify_all", notify_all_command))
 
-    # Message Handlers
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_star_amount))
-    application.add_handler(MessageHandler(
-        (filters.TEXT | filters.PHOTO | filters.VIDEO | filters.Document.ALL) & ~filters.COMMAND,
-        handle_notification_message
-    ))
+    # File Handler for Admins
+    application.add_handler(MessageHandler(filters.Document.ALL | filters.PHOTO, admin_file_handler))
 
-    # Callback Query Handlers
-    application.add_handler(CallbackQueryHandler(cancel_star_purchase_callback, pattern=r'^cancel_star_purchase$'))
-    application.add_handler(CallbackQueryHandler(back_to_main_callback, pattern=r'^back_to_main$'))
-    application.add_handler(CallbackQueryHandler(topup_wallet_callback, pattern=r'^topup_wallet$'))
-    application.add_handler(CallbackQueryHandler(purchase_questions_callback, pattern=r'^purchase_questions$'))
-    application.add_handler(CallbackQueryHandler(profile_callback, pattern=r'^profile$'))
-    application.add_handler(CallbackQueryHandler(about_us_callback, pattern=r'^about_us$'))
+    # Message Handler for Star Amount
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_star_amount))
 
     # Callback Query Handlers for purchase flow
     application.add_handler(CallbackQueryHandler(department_callback, pattern=r'^dept_'))
@@ -1438,19 +1518,46 @@ def main():
     application.add_handler(CommandHandler("upload_qp", upload_qp))
     application.add_handler(CommandHandler("remove_qp", remove_qp))
     application.add_handler(CommandHandler("list_qp", list_qp))
-    # File upload handler for admin
-    application.add_handler(MessageHandler(filters.Document.ALL | filters.PHOTO, admin_file_handler))
-
-    # Admin channel management commands
+    # Bulk Operations
+    application.add_handler(CommandHandler("add_bulk", add_bulk))
+    # Channel Management
     application.add_handler(CommandHandler("add_channel", add_channel_command))
     application.add_handler(CommandHandler("remove_channel", remove_channel_command))
     application.add_handler(CommandHandler("list_channels", list_channels_command))
-
-    # Callback handlers
+    # Subscription Check
     application.add_handler(CallbackQueryHandler(check_subscription_callback, pattern="^check_subscription$"))
 
-    print("Bot polling...")
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+    # Start the Bot with a clean shutdown
+    print("Bot starting...")
+    try:
+        application.run_polling(drop_pending_updates=True)
+    except Exception as e:
+        print(f"Error running bot: {e}")
+    finally:
+        print("Bot shutting down...")
+        cleanup()
 
-if __name__ == "__main__":
-    main() 
+if __name__ == '__main__':
+    try:
+        if is_bot_running():
+            print("Error: Bot is already running!")
+            sys.exit(1)
+            
+        # Save PID and register cleanup
+        save_pid()
+        atexit.register(cleanup)
+        
+        # Register signal handlers
+        signal.signal(signal.SIGINT, signal_handler)
+        signal.signal(signal.SIGTERM, signal_handler)
+        
+        # Initialize database
+        init_db()
+        
+        # Start the bot
+        print("Bot starting...")
+        main()
+    except Exception as e:
+        print(f"Fatal error: {e}")
+        cleanup()
+        sys.exit(1) 
